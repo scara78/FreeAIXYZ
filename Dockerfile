@@ -7,12 +7,8 @@ WORKDIR /app
 
 # ─── Dependencies ──────────────────────────────────────────────────────────
 FROM base AS deps
-COPY package.json bun.lock* package-lock.json* yarn.lock* ./
-RUN \
-  if [ -f bun.lock ]; then npm install -g bun && bun install --frozen-lockfile; \
-  elif [ -f package-lock.json ]; then npm ci; \
-  elif [ -f yarn.lock ]; then yarn --frozen-lockfile; \
-  else npm install; fi
+COPY package.json package-lock.json ./
+RUN npm ci
 
 # ─── Builder ───────────────────────────────────────────────────────────────
 FROM base AS builder
