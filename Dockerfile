@@ -40,7 +40,7 @@ COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
 
 # Copy WASM signer files (required for FreeGPT provider)
-COPY --from=builder /app/wasm_signer_bg.wasm ./wasm_signer_bg.wasm
+# wasm_signer_bg.wasm is generated at runtime or not present in all environments
 COPY --from=builder /app/wasm_signer.js ./wasm_signer.js
 COPY --from=builder /app/src/lib/freegpt-signer.cjs ./src/lib/freegpt-signer.cjs
 
