@@ -16,9 +16,6 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# Generate Prisma client
-RUN npx prisma generate
-
 # Build Next.js (outputs standalone + static)
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV NODE_ENV=production
@@ -42,18 +39,10 @@ COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
 
-# Copy Prisma schema + migrations + SQLite db dir
-COPY --from=builder /app/prisma ./prisma
-COPY --from=builder /app/db ./db
-
 # Copy WASM signer files (required for FreeGPT provider)
 COPY --from=builder /app/wasm_signer_bg.wasm ./wasm_signer_bg.wasm
 COPY --from=builder /app/wasm_signer.js ./wasm_signer.js
 COPY --from=builder /app/src/lib/freegpt-signer.cjs ./src/lib/freegpt-signer.cjs
-
-# Copy generated Prisma client into standalone
-COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
-COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
 
 RUN chown -R nextjs:nodejs /app
 
@@ -61,5 +50,4 @@ USER nextjs
 
 EXPOSE 3000
 
-# Run DB migrations then start server
-CMD ["sh", "-c", "npx prisma db push --accept-data-loss 2>/dev/null || true && node server.js"]
+CMD ["node", "server.js"]
