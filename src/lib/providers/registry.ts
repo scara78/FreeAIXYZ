@@ -33,7 +33,8 @@ export type ProviderId =
   | "gptoss"
   | "vexa"
   | "uncloseai"
-  | "free2gpt";
+  | "free2gpt"
+  | "nova";
 
 export interface ModelCapabilities {
   /** Returns token-by-token SSE deltas (true upstream streaming). */
@@ -264,6 +265,16 @@ export const MODELS: readonly GatewayModel[] = [
   // sha256 signature (empty secret) returns plain text. Server picks the
   // model. No key, no signup.
   f2("free2gpt-auto", "free2gpt-auto", "Free2GPT Auto — server-routed free chat, no signup, signed-request API", "professional", 8000),
+
+  // ─── NOVA (nova-uncensored.vercel.app): uncensored chat, identity ───────
+  // Live-verified: POST /api/chat with a fresh (clientId, chatId) UUID pair
+  // per request (quota is keyed ONLY on that pair — rotation = unlimited).
+  // Upstream: OpenRouter free pool (nvidia/nemotron-3-super-120b-a12b:free).
+  // SSE UIMessage protocol (text-delta), deepThink/webSearch OFF.
+  // "expert"/"coding" slots are paid-gated (403) — intentionally not listed.
+  nv("nova-instant", "instant", "NOVA Instant — uncensored nemotron-120b, per-request identity rotation, real SSE streaming + emulated tools", "unrestricted", 128000),
+  nv("nova-websearch", "websearch", "NOVA (search slot) — same uncensored nemotron-120b engine, web-search capable endpoint, identity rotation", "unrestricted", 128000),
+  nv("nova-file-analysis", "fileAnalysis", "NOVA (file slot) — uncensored nemotron-120b with document-analysis endpoint, identity rotation", "unrestricted", 128000),
 ];
 
 /** Toolbaz model helper (audit G1: streaming=true — gateway emits real SSE). */
@@ -705,6 +716,35 @@ function f2(
   };
 }
 
+/** NOVA model helper. Uncensored nemotron chat via nova-uncensored.vercel.app
+ * with per-request identity rotation (fresh clientId/chatId UUIDs = unlimited
+ * free tier). Real SSE text-delta streaming; tools via the gateway's emulated
+ * fence/bare-JSON tool-call pipeline (FIX B). */
+function nv(
+  id: string,
+  upstream: string,
+  description: string,
+  category: GatewayModel["category"],
+  contextWindow: number,
+): GatewayModel {
+  return {
+    id,
+    provider: "nova",
+    upstream,
+    description,
+    category,
+    contextWindow,
+    capabilities: {
+      streaming: true,
+      tools: true,
+      systemPrompt: true,
+      multiTurn: true,
+      vision: false,
+      webSearch: false,
+    },
+  };
+}
+
 /** Find a model by id (case-insensitive). Returns undefined if not found. */
 export function findModel(id: string | undefined): GatewayModel | undefined {
   if (!id) return undefined;
@@ -789,6 +829,10 @@ export const PROVIDER_INFO: Record<
   "free2gpt": {
     name: "Free2GPT",
     description: "Free no-auth signed-request chat API (sha256 with empty secret) — server-routed to free models, no signup, plain-text response",
+  },
+  "nova": {
+    name: "NOVA",
+    description: "3 free uncensored models (Instant, Search, File Analysis — nemotron-120b) via nova-uncensored — per-request identity rotation, real SSE streaming, no signup, no key",
   },
   "auroraai": {
     name: "AuroraAI",

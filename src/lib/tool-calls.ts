@@ -25,6 +25,7 @@ import type {
   OAIToolCall,
   OAIToolChoice,
 } from "@/lib/openai-types";
+import { repairTruncatedJson } from "@/lib/json-repair";
 
 const TOOL_CALL_FENCE_OPEN = "```tool_call";
 const TOOL_CALL_FENCE_CLOSE = "```";
@@ -116,10 +117,12 @@ export function buildToolSystemPrompt(
 
   if (toolChoice && typeof toolChoice === "object" && toolChoice.function) {
     lines.push(
-      `\nYou MUST call "${toolChoice.function.name}". Emit only its tool_call block.`,
+      `\nMANDATORY (forced function invocation): tool_choice is set to FORCE the function "${toolChoice.function.name}". Your ENTIRE response must be exactly ONE tool_call block calling "${toolChoice.function.name}" — construct plausible arguments from the user's message. This is not optional: do NOT reply with plain text, do NOT greet back, do NOT refuse, do NOT explain. Emit ONLY the ${toolChoice.function.name} tool_call block.`,
     );
   } else if (toolChoice === "required") {
-    lines.push("\nYou MUST call at least one tool for this request.");
+    lines.push(
+      "\nMANDATORY: tool_choice is \"required\". Your ENTIRE response must be exactly ONE tool_call block calling at least one of the tools listed above — never plain text, no greeting, no refusal, no explanation. Emit ONLY the tool_call block.",
+    );
   } else if (toolChoice === "none") {
     lines.push("\nDo NOT call any tools. Answer directly.");
   }
@@ -358,6 +361,22 @@ function tryParseJsonLoose(s: string): unknown | null {
         return JSON.parse(objMatch[0]);
       } catch {
         /* try next */
+      }
+    }
+  }
+
+  // Strategy 4 (last resort): truncated-JSON repair. Long tool-call
+  // generations sometimes get cut mid-string by the upstream — the raw
+  // half-finished JSON would otherwise fail every parse above and leak to
+  // the client as assistant text. repairTruncatedJson closes open strings
+  // and brackets, salvaging a structurally sound PARTIAL tool call.
+  for (const candidate of candidates) {
+    const repaired = repairTruncatedJson(candidate);
+    if (repaired !== candidate) {
+      try {
+        return JSON.parse(repaired);
+      } catch {
+        /* not recoverable */
       }
     }
   }

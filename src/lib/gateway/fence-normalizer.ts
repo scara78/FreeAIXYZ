@@ -45,6 +45,7 @@
  */
 
 import { generateToolCallId } from "@/lib/openai-types";
+import { freshBalance, feedBalance, repairTruncatedJson } from "@/lib/json-repair";
 
 /** One normalized tool-call fragment (complete call — safe for accumulators). */
 export interface FenceToolCallFragment {
@@ -87,9 +88,43 @@ const OPENER_LITERALS: string[] = [
 ];
 
 const FENCE_CLOSE = "```";
-const MAX_OPENER_LEN = Math.max(...OPENER_LITERALS.map((s) => s.length));
 
-type Mode = "text" | "fence" | "dsml";
+/**
+ * BARE-JSON tool-call openers. Real upstreams (observed live) write the tool
+ * call as plain JSON with NO fence at all:
+ *
+ *   [{"name":"ask_user","arguments":{"questions":[...]}}]
+ *
+ * The trigger fires on `[{\s*{\s*"<key>"\s*:` where <key> is any key that
+ * marks an object as tool-call-SHAPED. Firing early (before we can know
+ * whether an arguments key follows) is safe: the accumulated container is
+ * validated at completion and re-emitted as text when it is ordinary JSON.
+ */
+const BARE_KEYS = [
+  "__tool_calls",
+  "function_name",
+  "function",
+  "arguments",
+  "parameters",
+  "name",
+  "args",
+  "tool",
+] as const;
+const BARE_KEY_ALT = BARE_KEYS.join("|");
+const BARE_OPEN_RE = new RegExp(
+  `(\\[\\s*\\{\\s*"(?:${BARE_KEY_ALT})"\\s*:|\\{\\s*"(?:${BARE_KEY_ALT})"\\s*:)`,
+);
+/** Canonical (whitespace-stripped) trigger literals for hold-back math. */
+const BARE_TRIGGERS: string[] = [];
+for (const k of BARE_KEYS) {
+  BARE_TRIGGERS.push(`[{"${k}":`, `{"${k}":`);
+}
+/** Keys that mark an object as having a tool NAME. */
+const BARE_NAME_KEYS = ["name", "function_name", "tool"] as const;
+/** Keys that mark an object as having tool ARGUMENTS. */
+const BARE_ARGS_KEYS = ["arguments", "args", "parameters"] as const;
+
+type Mode = "text" | "fence" | "dsml" | "bare";
 
 /**
  * One instance PER STREAM. Feed it every `delta.content` piece via push();
@@ -104,6 +139,12 @@ export class FenceNormalizer {
   private openerText = "";
   /** Extra buffer for fence/dsml bodies (pending holds only the tail). */
   private openerBody = "";
+  /** Bare-JSON container body accumulated while mode === "bare". */
+  private bareBody = "";
+  /** How many chars of bareBody have been fed into the balance scanner. */
+  private bareFed = 0;
+  /** Bracket/string balance scanner state for the open bare container. */
+  private bareBalance = freshBalance();
   private hadToolCalls = false;
   private emittedCount = 0;
   private enabled: boolean;
@@ -168,7 +209,22 @@ export class FenceNormalizer {
         const useFence =
           fenceMatch !== null &&
           (dsmlMatch === null || fenceMatch.index <= dsmlMatch.index);
-        const match = useFence ? fenceMatch : dsmlMatch;
+        let match = useFence ? fenceMatch : dsmlMatch;
+        if (match === null) {
+          // 1b. BARE-JSON tool-call opener? (no fence at all — observed on
+          // real upstreams). Accumulate the container while it streams.
+          const bareMatch = BARE_OPEN_RE.exec(this.pending);
+          if (bareMatch !== null) {
+            outTextParts.push(this.pending.slice(0, bareMatch.index));
+            this.bareBody = this.pending.slice(bareMatch.index);
+            this.pending = "";
+            this.bareFed = 0;
+            this.bareBalance = freshBalance();
+            this.mode = "bare";
+            continue;
+          }
+          match = null;
+        }
         if (match !== null) {
           outTextParts.push(this.pending.slice(0, match.index));
           this.openerText = match[0];
@@ -178,15 +234,59 @@ export class FenceNormalizer {
         }
 
         // 2. No complete opener. Hold back a tail that could still COMPLETE
-        //    into an opener (split across deltas). At end-of-stream there is
-        //    nothing left to wait for → release everything.
-        const hold = final ? 0 : this.openerPrefixSuffixLen(this.pending);
+        //    into an opener (split across deltas) — fence/DSML opener
+        //    prefixes AND bare-JSON trigger prefixes. At end-of-stream there
+        //    is nothing left to wait for → release everything.
+        const hold = final
+          ? 0
+          : Math.max(
+              this.openerPrefixSuffixLen(this.pending),
+              this.bareTriggerSuffixLen(this.pending),
+            );
         const emitLen = this.pending.length - hold;
         if (emitLen > 0) {
           outTextParts.push(this.pending.slice(0, emitLen));
           this.pending = this.pending.slice(emitLen);
         }
         break; // nothing more can happen in text mode
+      }
+
+      if (this.mode === "bare") {
+        // 1c. New text always lands in `pending` (push) — move it into the
+        //     bare container body first, then feed the un-fed portion into
+        //     the bracket/string balance scanner. When nesting returns to
+        //     zero the container is COMPLETE — parse it. Everything after
+        //     the completion index returns to text mode.
+        if (this.pending) {
+          this.bareBody += this.pending;
+          this.pending = "";
+        }
+        const unfed = this.bareBody.slice(this.bareFed);
+        this.bareFed = this.bareBody.length;
+        const rel = feedBalance(this.bareBalance, unfed);
+        if (rel !== -1) {
+          const abs = this.bareBody.length - unfed.length + rel;
+          const completed = this.bareBody.slice(0, abs + 1);
+          this.pending = this.bareBody.slice(abs + 1);
+          this.bareBody = "";
+          this.bareFed = 0;
+          this.bareBalance = freshBalance();
+          this.finishBare(completed, false, outTextParts, outCalls);
+          continue;
+        }
+        if (final) {
+          // Truncated at end-of-stream — repair the JSON (close open
+          // strings/brackets) and try to salvage a partial tool call.
+          const whole = this.bareBody;
+          this.bareBody = "";
+          this.bareFed = 0;
+          this.mode = "text";
+          this.finishBare(whole, true, outTextParts, outCalls);
+          break;
+        }
+        // Still open — keep accumulating (the body must never leak as
+        // text before we know whether it is a tool call).
+        break;
       }
 
       if (this.mode === "fence") {
@@ -256,6 +356,64 @@ export class FenceNormalizer {
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
+   * A balanced (or end-of-stream truncated) bare-JSON container: validate
+   * that it is tool-call-shaped (name + arguments-ish keys), convert to
+   * standard tool calls, or re-emit it as text when it is ordinary JSON.
+   */
+  private finishBare(
+    body: string,
+    truncated: boolean,
+    outTextParts: string[],
+    outCalls: FenceToolCallFragment[],
+  ): void {
+    this.mode = "text";
+    const calls = parseBareBody(body, truncated);
+    if (calls !== null && calls.length > 0) {
+      for (const call of calls) {
+        outCalls.push({
+          index: this.emittedCount,
+          id: generateToolCallId(),
+          type: "function",
+          function: { name: call.name, arguments: call.arguments },
+        });
+        this.emittedCount++;
+      }
+      this.hadToolCalls = true;
+      return;
+    }
+    // Ordinary JSON (or unparseable) — re-emit as text (never lose content).
+    outTextParts.push(body);
+  }
+
+  /**
+   * Length of the longest suffix of `s` whose whitespace-stripped form is a
+   * strict prefix of a bare-JSON trigger literal — i.e. a tail that could
+   * still complete into `[{"name":` etc. across delta boundaries.
+   * Whitespace between JSON tokens is tolerated by stripping it from the
+   * suffix before the prefix check; a suffix consisting purely of
+   * whitespace also counts (it may precede an incoming trigger).
+   */
+  private bareTriggerSuffixLen(s: string): number {
+    if (s.length === 0) return 0;
+    // Valid trigger prefixes are ≤ 17 canonical chars — only the last
+    // (canonical-length + whitespace) region can hold one.
+    const maxCanon = 20;
+    const window = s.length > maxCanon * 8 ? s.slice(s.length - maxCanon * 8) : s;
+    for (let p = 0; p < window.length; p++) {
+      const tail = window.slice(p);
+      const canon = tail.replace(/\s+/g, "");
+      if (BARE_TRIGGERS.some((t) => t.startsWith(canon) && canon.length < t.length)) {
+        return tail.length;
+      }
+      // Pure-whitespace tail — hold it (a trigger may follow immediately).
+      if (canon.length === 0 && tail.length > 0) {
+        return tail.length;
+      }
+    }
+    return 0;
+  }
+
+  /**
    * A closed (or end-of-stream unterminated) fence: parse the body into tool
    * calls, or re-emit the whole block as text when unparseable.
    */
@@ -268,7 +426,9 @@ export class FenceNormalizer {
     this.mode = "text";
     const fullBody = this.openerBody + body;
     this.openerBody = "";
-    const calls = parseFenceBody(fullBody);
+    // Unterminated-at-EOF fence → allow truncated-JSON repair so a cut-off
+    // tool call still fires instead of leaking raw text.
+    const calls = parseFenceBody(fullBody, unterminated);
     if (calls !== null && calls.length > 0) {
       for (const call of calls) {
         outCalls.push({
@@ -359,11 +519,86 @@ export interface ParsedToolCall {
  * Returns null when the body does not yield ANY valid call (caller re-emits
  * as text).
  */
-export function parseFenceBody(body: string): ParsedToolCall[] | null {
+export function parseFenceBody(
+  body: string,
+  allowRepair = false,
+): ParsedToolCall[] | null {
   const trimmed = body.trim();
   if (!trimmed) return null;
 
-  for (const candidate of jsonCandidates(trimmed)) {
+  for (const candidate of jsonCandidates(trimmed, allowRepair)) {
+    const calls = extractCalls(candidate);
+    if (calls !== null && calls.length > 0) return calls;
+  }
+  return null;
+}
+
+/**
+ * Parse a BARE (unfenced) JSON container into tool calls. Stricter than
+ * parseFenceBody: a bare container must be tool-call-SHAPED — the first
+ * item needs BOTH a name-ish key AND an arguments-ish key — otherwise it
+ * is ordinary JSON (an example object in prose, a config dump, …) and is
+ * re-emitted as text by the caller.
+ */
+function parseBareBody(
+  body: string,
+  truncated: boolean,
+): ParsedToolCall[] | null {
+  const trimmed = body.trim();
+  if (!trimmed) return null;
+
+  for (const candidate of jsonCandidates(trimmed, truncated)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+
+    // `__tool_calls` marker object (providers that serialize native
+    // tool_calls deltas as JSON marker strings).
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      Array.isArray((parsed as Record<string, unknown>).__tool_calls)
+    ) {
+      const inner = (parsed as Record<string, unknown>).__tool_calls as Array<
+        Record<string, unknown>
+      >;
+      const calls: ParsedToolCall[] = [];
+      for (const c of inner) {
+        if (!c || typeof c !== "object") continue;
+        if (typeof c.name !== "string" || !c.name) continue;
+        const raw = c.arguments;
+        const args =
+          typeof raw === "string"
+            ? raw
+            : raw === undefined || raw === null
+              ? "{}"
+              : JSON.stringify(raw);
+        calls.push({ name: c.name, arguments: args });
+      }
+      if (calls.length > 0) return calls;
+      continue;
+    }
+
+    const arr = Array.isArray(parsed) ? parsed : [parsed];
+    const first = arr.find(
+      (x) => x !== null && typeof x === "object",
+    ) as Record<string, unknown> | undefined;
+    if (!first) continue;
+    const fn = (first.function ?? null) as Record<string, unknown> | null;
+    const hasName =
+      BARE_NAME_KEYS.some(
+        (k) => typeof (first as Record<string, unknown>)[k] === "string",
+      ) || typeof fn?.name === "string";
+    const hasArgs =
+      BARE_ARGS_KEYS.some(
+        (k) => (first as Record<string, unknown>)[k] !== undefined,
+      ) || fn?.arguments !== undefined;
+    if (!hasName || !hasArgs) continue; // ordinary JSON — not a tool call
+
     const calls = extractCalls(candidate);
     if (calls !== null && calls.length > 0) return calls;
   }
@@ -410,10 +645,19 @@ function extractCalls(candidate: string): ParsedToolCall[] | null {
     if (item === null || typeof item !== "object") continue;
     const obj = item as Record<string, unknown>;
     const fn = (obj.function ?? null) as Record<string, unknown> | null;
-    const name = typeof obj.name === "string" ? obj.name : typeof fn?.name === "string" ? (fn?.name as string) : undefined;
+    const name =
+      typeof obj.name === "string"
+        ? obj.name
+        : typeof obj.function_name === "string"
+          ? obj.function_name
+          : typeof obj.tool === "string"
+            ? obj.tool
+            : typeof fn?.name === "string"
+              ? (fn?.name as string)
+              : undefined;
     if (!name) continue;
     const rawArgs =
-      obj.arguments ?? fn?.arguments ?? fn?.parameters ?? obj.parameters;
+      obj.arguments ?? obj.args ?? fn?.arguments ?? fn?.parameters ?? obj.parameters;
     const args =
       typeof rawArgs === "string"
         ? rawArgs
@@ -427,8 +671,12 @@ function extractCalls(candidate: string): ParsedToolCall[] | null {
 
 /**
  * Loose-JSON candidates for models that emit escaped / prose-wrapped JSON.
+ * When `allowRepair` is set (end-of-stream truncated container / fence),
+ * repaired variants are appended — repairTruncatedJson closes open strings
+ * and brackets so a cut-off tool call still parses (identity on balanced
+ * JSON, so appending it is always safe).
  */
-function jsonCandidates(s: string): string[] {
+function jsonCandidates(s: string, allowRepair = false): string[] {
   const candidates: string[] = [s];
 
   // Unescape \" → " (single-escaped).
@@ -448,6 +696,18 @@ function jsonCandidates(s: string): string[] {
     const lastIdx = s.lastIndexOf(close);
     if (lastIdx > pick) {
       candidates.push(s.slice(pick, lastIdx + 1));
+    }
+  }
+
+  if (allowRepair) {
+    // Truncated-JSON repair: whole string and the extracted container.
+    candidates.push(repairTruncatedJson(s));
+    if (pick !== -1) {
+      const open = s[pick];
+      const close = open === "[" ? "]" : "}";
+      const lastIdx = s.lastIndexOf(close);
+      const end = lastIdx > pick ? lastIdx + 1 : s.length;
+      candidates.push(repairTruncatedJson(s.slice(pick, end)));
     }
   }
 
