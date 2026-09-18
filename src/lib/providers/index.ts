@@ -20,6 +20,7 @@ import { vexaProvider } from "./vexa";
 // Task 7 (v4): new free providers discovered via web research + live-tested.
 import { uncloseAiProvider } from "./uncloseai";
 import { free2GptProvider } from "./free2gpt";
+import { novaProvider } from "./nova";
 // FreeGPT provider is NOT imported here — it uses Node.js APIs (eval("require"),
 // fs, path) that break Edge runtime. It's imported directly in the Node.js
 // proxy route: /api/v1/chat/freegpt-proxy
@@ -43,6 +44,7 @@ export const PROVIDERS: Partial<Record<ProviderId, Provider>> = {
   // Task 7 (v4): new free providers.
   uncloseai: uncloseAiProvider,
   free2gpt: free2GptProvider,
+  nova: novaProvider,
   // freegpt is handled via Node.js proxy route, not here
 };
 

@@ -25,6 +25,7 @@ import { execSync } from "child_process";
 import { resolveGatewayModel } from "@/lib/providers/registry";
 import { generateCompletionId, generateToolCallId, estimateTokens, type OAITool, type OAIToolCall, type OAIToolChoice } from "@/lib/openai-types";
 import { parseToolCalls, buildToolSystemPrompt } from "@/lib/tool-calls";
+import { FenceNormalizer, type FenceDeltaOut } from "@/lib/gateway/fence-normalizer";
 import type { ProviderTool } from "@/lib/providers/types";
 import {
   GatewayError,
@@ -296,29 +297,39 @@ async function* streamFromUpstream(
   if (wantsWebSearch) params += "&frontend_web_search_active=true";
   const sseUrl = `${AJAX_URL}?${params}`;
 
+  // ─── UNLIMITED OUTPUT: 270s generation window. The old 120s cap cut long
+  // generations mid-string — a truncated tool call failed JSON.parse and
+  // leaked to the client as raw text. 270s + ~10s of cache/nonce work stays
+  // inside the route's 300s maxDuration budget (and local dev has no cap).
   const { spawn } = require("child_process") as typeof import("child_process");
-  const proc = spawn("curl", ["-s", "-N", "--max-time", "120", "-H", `User-Agent: ${UA}`, "-H", `Referer: ${CHAT_URL}`, "-H", "Origin: https://unlimitedai.org", "-H", "Accept: text/event-stream", sseUrl]);
+  const proc = spawn("curl", ["-s", "-N", "--max-time", "270", "-H", `User-Agent: ${UA}`, "-H", `Referer: ${CHAT_URL}`, "-H", "Origin: https://unlimitedai.org", "-H", "Accept: text/event-stream", sseUrl]);
 
   let buf = "";
-  for await (const chunk of proc.stdout) {
-    buf += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() || "";
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t || !t.startsWith("data:")) continue;
-      const raw = t.substring(5).trim();
-      if (raw === "[DONE]" || raw.includes('"finished":true')) continue;
-      try {
-        const p = JSON.parse(raw);
-        if (typeof p.delta === "string" && p.delta) yield p.delta;
-        else if (typeof p.content === "string" && p.content) yield p.content;
-        else if (typeof p.text === "string" && p.text) yield p.text;
-        else if (Array.isArray(p.choices) && p.choices[0]?.delta?.content) yield p.choices[0].delta.content;
-      } catch {
-        if (raw && raw !== "[DONE]") yield raw;
+  try {
+    for await (const chunk of proc.stdout) {
+      buf += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop() || "";
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t || !t.startsWith("data:")) continue;
+        const raw = t.substring(5).trim();
+        if (raw === "[DONE]" || raw.includes('"finished":true')) continue;
+        try {
+          const p = JSON.parse(raw);
+          if (typeof p.delta === "string" && p.delta) yield p.delta;
+          else if (typeof p.content === "string" && p.content) yield p.content;
+          else if (typeof p.text === "string" && p.text) yield p.text;
+          else if (Array.isArray(p.choices) && p.choices[0]?.delta?.content) yield p.choices[0].delta.content;
+        } catch {
+          if (raw && raw !== "[DONE]") yield raw;
+        }
       }
     }
+  } finally {
+    // Kill the child on early generator return (client abort / stream
+    // wrapped up) so curl never lingers to its 270s cap.
+    try { proc.kill(); } catch { /* already exited */ }
   }
 }
 
@@ -483,32 +494,61 @@ async function freeaixyzProxy(request: NextRequest): Promise<Response> {
         await send({ id, object: "chat.completion.chunk", created, model: modelId, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
 
         if (useTools) {
-          // firstDelta is already in hand from the pre-flight; accumulate
-          // the rest from the (already-opened) generator.
-          let fullText = firstDelta;
-          for await (const delta of preflight) { if (delta) fullText += delta; }
-          const parsed = parseRealToolCalls(fullText);
-          if (parsed.toolCalls.length > 0) {
-            for (let i = 0; i < parsed.toolCalls.length; i++) {
-              const tc: OAIToolCall = parsed.toolCalls[i];
-              await send({ id, object: "chat.completion.chunk", created, model: modelId, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: tc.function.arguments } }] }, finish_reason: null }] });
+          // ─── THE "still not streaming" FIX ─────────────────────────────
+          // The old implementation accumulated the ENTIRE upstream response
+          // (fullText += delta …) before emitting anything, then dumped the
+          // whole reply at once — every OpenAI-compatible client saw the
+          // full message land in a single burst ("not streaming in Open
+          // WebUI"). Now every delta flows through the FenceNormalizer
+          // IMMEDIATELY: text forwards as delta.content the moment it
+          // arrives, while fenced / bare-JSON tool calls (the
+          // [{"name":…,"arguments":…}] the upstream writes inline) are
+          // detected mid-stream, accumulated, and re-emitted as standard
+          // incremental `delta.tool_calls` chunks — never as raw content.
+          // A container truncated by the upstream is repaired
+          // (json-repair) at flush so a cut-off call still fires.
+          const fence = new FenceNormalizer(true);
+          let emittedToolCalls = false;
+          let sawAnyOutput = false;
+
+          const forwardFenceOut = async (out: FenceDeltaOut) => {
+            if (out.content) {
+              sawAnyOutput = true;
+              await send({ id, object: "chat.completion.chunk", created, model: modelId, choices: [{ index: 0, delta: { content: out.content }, finish_reason: null }] });
             }
-            await send({ id, object: "chat.completion.chunk", created, model: modelId, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
-          } else {
-            // R-5: empty content (no tool calls extracted + no full text)
-            // surfaces as a mid-stream event:error + terminal chunk (the
-            // stream is already open over 200 OK, so we can't promote it
-            // to a real HTTP status — the pre-flight already succeeded).
-            const content = (parsed.text || fullText).trim();
-            if (!content) {
-              hadError = true;
-              sendStreamError(emptyUpstreamResponseError("freeaixyz", modelId));
-              return;
+            if (out.toolCalls && out.toolCalls.length > 0) {
+              // Placeholder-template echoes (e.g. name "<tool_name>") are
+              // unresolvable garbage — never forward them as calls.
+              const real = out.toolCalls.filter(
+                (tc) => !isPlaceholderCall({ id: tc.id, type: "function", function: { name: tc.function.name, arguments: tc.function.arguments } } as OAIToolCall),
+              );
+              if (real.length > 0) {
+                sawAnyOutput = true;
+                emittedToolCalls = true;
+                await send({ id, object: "chat.completion.chunk", created, model: modelId, choices: [{ index: 0, delta: { tool_calls: real.map((tc, i) => ({ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: tc.function.arguments } })) }, finish_reason: null }] });
+              }
             }
-            const tokens = (parsed.text || fullText).match(/(\s+|\S+)/g) ?? [parsed.text || fullText];
-            for (const t of tokens) await send({ id, object: "chat.completion.chunk", created, model: modelId, choices: [{ index: 0, delta: { content: t }, finish_reason: null }] });
-            await send({ id, object: "chat.completion.chunk", created, model: modelId, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+          };
+
+          // firstDelta is already in hand from the pre-flight.
+          await forwardFenceOut(fence.push(firstDelta));
+          for await (const delta of preflight) {
+            if (!delta) continue;
+            await forwardFenceOut(fence.push(delta));
           }
+          // End of stream: release held-back text, close any unterminated
+          // fence/bare container (with truncated-JSON repair), emit calls.
+          await forwardFenceOut(fence.flush());
+
+          // R-5: refuse to pass on a fully-empty stream.
+          if (!sawAnyOutput) {
+            hadError = true;
+            sendStreamError(emptyUpstreamResponseError("freeaixyz", modelId));
+            return;
+          }
+          // PRD §13 + FIX B: tool_calls finish_reason so OpenAI clients
+          // route to their tool-execution pipeline.
+          await send({ id, object: "chat.completion.chunk", created, model: modelId, choices: [{ index: 0, delta: {}, finish_reason: emittedToolCalls ? "tool_calls" : "stop" }] });
         } else {
           // Forward each upstream delta immediately. firstDelta is already
           // in hand from the pre-flight — emit it now, then continue pulling

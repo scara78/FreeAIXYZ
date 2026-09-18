@@ -84,7 +84,10 @@ import { isTransientUpstreamError, retryDelayMs, sleep, withRetry } from "@/lib/
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+// 300s (Vercel max) — long generations (unlimited output) must not be cut
+// off mid-stream by the route budget. The fx/* proxy hop already runs at
+// 300s; the main route is the pass-through surface and must match it.
+export const maxDuration = 300;
 
 /**
  * Hop-by-hop / content-encoding headers that MUST be stripped from any
